@@ -1,0 +1,8 @@
+#!/bin/bash
+set -eux
+
+REL_ID=`relation-ids db`
+ID=${REL_ID//[!0-9]}
+DATABASE=gitlab_${ID}
+
+relation-set database=$DATABASE extensions=plpgsql

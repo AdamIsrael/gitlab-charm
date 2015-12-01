@@ -1,0 +1,5 @@
+#!/bin/bash
+
+echo DROP DATABASE gitlab | psql
+
+sudo -u gitlab -H rm -f ~gitlab/gitlab/config/database.yml

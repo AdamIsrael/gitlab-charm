@@ -1,0 +1,215 @@
+#!/bin/bash
+# Sets more verbose output to help debugging
+set -eux
+
+# Boiler plate code to print context of this script
+juju-log $JUJU_REMOTE_UNIT modified its settings
+juju-log Relation settings:
+relation-get
+juju-log Relation members:
+relation-list
+
+# inc/common has some common variables used through the rest of the script
+source inc/common
+
+# If there is a config file already, Joomla is already installed & config'ed
+# if [ -f ~gitlab/gitlab/config/database.yml ]; then
+# 	juju-log "Database relation is already setup. Nothing to be done"
+# 	# TODO: Update the config file with new DB values even
+# 	exit 0
+# fi
+
+# Relation properties
+database=`relation-get database`
+user=`relation-get user`
+password=`relation-get password`
+host=`relation-get private-address`
+
+# Admin password from config.yaml
+admin_password=`config-get admin_password`
+
+# Secret key
+secret_key=`pwgen 32 1`
+
+# Sanity checks
+## If there is no database name defined stop assuming we will be re-run when there is
+if [ -z "$database" ] ; then
+    exit 0
+fi
+# if [ "$user" -ne "gitlab" ]; then
+#   exit 0
+# fi
+
+## If the user has given no password to the admin user exit with an error
+if [ -z "$admin_password" ] ; then
+	juju-log "No admin password given. Refusing to create an insecure site"
+	juju-log "Please, use config.yaml to provide a proper admin password"
+	exit 1
+fi
+
+function configure_database() {
+	# Generates the proper database config
+	juju-log Configuring GitLab database
+
+  cd /home/git/gitlab
+	sudo -u git -H sh -c "sed -e 's/^  database: gitlabhq_production/  database: $database/g' < config/database.yml.postgresql > config/database.yml"
+	sudo -u git -H sh -c "sed -i -e 's/^  # username: git/  username: $user/g' config/database.yml"
+	sudo -u git -H sh -c "sed -i -e 's/^  # password:/  password: \"$password\"/g' config/database.yml"
+	sudo -u git -H sh -c "sed -i -e 's/^  # host: localhost/  host: $host/g' config/database.yml"
+
+  # Stuff the details in .pgpass for cleanup if the relation is broken
+
+  # hostname:port:database:username:password
+  echo "$host:5432:$database:$user:$password" > /home/git/.pgpass
+  chown git:git /home/git/.pgpass
+  chmod 0600 /home/git/.pgpass
+	cd -
+}
+
+function install_gems() {
+	cd /home/git/gitlab
+
+	# TODO: this gem install is probably better off in the install hook
+	# sudo gem install charlock_holmes --version '0.6.9'
+
+	# modernizr is no longer available, so do some patching
+  # sed -i -e 's/^\(.*\)modernizr\(.*\)2.6.2\(.*\)$/\1modernizr-rails\22.7.1\3/' Gemfile
+  # sed -i -e 's/^\(.*\)modernizr\(.*\)2.6.2\(.*\)$/\1modernizr-rails\22.7.1\3/' Gemfile.lock
+
+	# For MySQL (note, the option says "without")
+	sudo -u git -H bundle install --deployment --without development test mysql
+	cd -
+}
+
+function init_database() {
+  cd /home/git/gitlab
+	juju-log "Seting up GitLab and initializing database"
+
+  sudo -u git -H bundle exec rake gitlab:shell:install[v2.6.4] REDIS_URL=unix:/var/run/redis/redis.sock RAILS_ENV=production
+
+	sudo -u git -H sh -c "yes yes | bundle exec rake gitlab:setup RAILS_ENV=production"
+	cd -
+}
+
+function precompile() {
+	# TODO: maybe this can be done during install, but I am not sure if it needs the db connection to
+	# be established already.
+  cd /home/git/gitlab
+
+	juju-log "Precompiling GitLab. This may take a while (15 minutes on ec2 t1.micro)..."
+	juju-log "Please, be patient"
+	sudo -u git -H bundle exec rake assets:precompile RAILS_ENV=production
+	juju-log "Precompile finished. Thanks for your patience"
+	cd -
+}
+
+function set_admin_password() {
+	encrypted_password=`ruby -e 'require "bcrypt"; puts BCrypt::Password.create(ARGV[0], :cost => 10)' $admin_password`
+	# TODO: allow for email to be config'ed too
+	echo UPDATE users set encrypted_password=\'$encrypted_password\' WHERE email=\'admin@example.com\' | \
+	PGPASSWORD=$password psql $database -h $host -U $user
+}
+
+
+function configure_gitlab() {
+  cd /home/git/gitlab
+
+	# Copy the example GitLab config
+	#sudo -u gitlab -H cp config/gitlab.yml.example config/gitlab.yml
+
+	# Updates the host name in gitlab.yml to the one given in the
+	# charm config
+	githost=`config-get host`
+	# TODO: add default values
+	sudo -u git -H sh -c "sed -e 's/^  host: localhost/  host: $githost/g' < config/gitlab.yml.example > config/gitlab.yml"
+
+	# TODO: update other config items in gitlab.yml
+	# sed -itmp
+
+	# Make sure GitLab can write to the log/ and tmp/ directories
+	chown -R git log/
+	chown -R git tmp/
+	chmod -R u+rwX  log/
+	chmod -R u+rwX  tmp/
+
+	# Make directory for satellites
+	sudo -u gitlab -H mkdir -p /home/gitlab/gitlab-satellites
+
+	# Copy the example Unicorn config
+	sudo -u git -H cp config/unicorn.rb.example config/unicorn.rb
+}
+
+function configure_git {
+	sudo -u git -H git config --global user.name "GitLab"
+	# TODO: get from charm config.yaml
+	sudo -u git -H git config --global user.email "gitlab@localhost"
+}
+
+# Hook functionality has changed since 4.1, and this is no longer relevant?
+# function setup_gitlab_hooks() {
+# 	cd /home/gitlab/gitlab
+# 	cp ./lib/hooks/post-receive /home/git/.gitolite/hooks/common/post-receive
+# 	chown git:git /home/git/.gitolite/hooks/common/post-receive
+# 	cd -
+# }
+
+function init_script() {
+  cd /home/git/gitlab
+  cp lib/support/init.d/gitlab /etc/init.d/gitlab
+	# curl -L --output /etc/init.d/gitlab https://raw.githubusercontent.com/gitlabhq/gitlab-recipes/4-1-stable/init.d/gitlab
+	chmod +x /etc/init.d/gitlab
+	update-rc.d gitlab defaults 21
+}
+
+function setup_logrotate() {
+  cd /home/git/gitlab
+  cp lib/support/logrotate/gitlab /etc/logrotate.d/gitlab
+}
+function config_nginx() {
+  cd /home/git/gitlab
+  cp lib/support/nginx/gitlab /etc/nginx/sites-available/gitlab
+
+	if [ ! -e /etc/nginx/sites-enabled/gitlab ]; then
+		ln -s /etc/nginx/sites-available/gitlab /etc/nginx/sites-enabled/gitlab
+	fi
+
+	if [ -e /etc/nginx/sites-enabled/default ]; then
+		rm /etc/nginx/sites-enabled/default
+	fi
+
+	# TODO: allow for config of hostname
+	sed -i -e 's/YOUR_SERVER_IP/0.0.0.0/g' /etc/nginx/sites-available/gitlab
+	sed -i -e "s/YOUR_SERVER_FQDN/$hostname/g" /etc/nginx/sites-available/gitlab
+	sed -i -e "s/# server_names_hash_bucket_size 64/server_names_hash_bucket_size 128/g" /etc/nginx/nginx.conf
+}
+
+juju-log "Adding database relation"
+
+# install_gitlab
+install_gems
+
+configure_database
+
+# Now that we have a working database, proceed with install
+configure_gitlab
+configure_git
+
+
+init_database
+set_admin_password
+precompile
+
+#setup_gitlab_hooks
+init_script
+setup_logrotate
+config_nginx
+
+
+juju-log "Opening port 80"
+open-port 80/tcp
+
+echo `pwd`
+if [ -f $CHARM_DIR/hooks/start ]; then
+  juju-log "Starting Nginx and GitLab"
+  $CHARM_DIR/hooks/start
+fi

@@ -1,0 +1,144 @@
+#!/bin/bash
+
+set -eux
+
+source inc/common
+
+function resolve_dependencies() {
+	juju-log "Installing dependencies using apt-get"
+
+	add-apt-repository -y ppa:charmers/charm-helpers
+
+	apt-get update && apt-get -y upgrade
+
+	apt-get -y install build-essential \
+		   zlib1g-dev \
+		   libyaml-dev \
+		   libssl-dev \
+		   libgdbm-dev \
+		   libreadline-dev \
+		   libncurses5-dev \
+		   libffi-dev \
+			 nginx \
+		   curl \
+		   git-core \
+		   openssh-server \
+		   redis-server \
+		   postfix \
+		   checkinstall \
+		   libxml2-dev \
+		   libxslt-dev \
+		   libcurl4-openssl-dev \
+		   libicu-dev \
+		   python2.7 \
+		   libmysqlclient-dev \
+		   charm-helper-sh \
+		   mysql-client-core-5.5 \
+		   sudo \
+			 cmake \
+			 nodejs \
+			 logrotate \
+			 python-docutils \
+			 pkg-config \
+			 libpq-dev \
+			 postgresql-client \
+		   pwgen
+}
+
+function install_ruby() {
+	# Latest gitlab recommends ruby 2.1.6, which isn't packaged, and they
+	# explicitly recommend against rvm or similar.
+	juju-log "Installing ruby 2.1.6"
+
+	mkdir -p /tmp/ruby && cd /tmp/ruby
+	curl -L --progress http://cache.ruby-lang.org/pub/ruby/2.1/ruby-2.1.6.tar.gz | tar xz
+	cd ruby-2.1.6
+	./configure --disable-install-rdoc
+	make
+	make install
+
+	juju-log "Installing bundler gem"
+	gem install bundler --no-ri --no-rdoc
+
+	juju-log "Installing bcrypt-ruby gem"
+	gem install bcrypt-ruby
+
+}
+
+function install_go() {
+	juju-log "Installing go 1.5"
+	curl -O --progress https://storage.googleapis.com/golang/go1.5.linux-amd64.tar.gz
+	echo '5817fa4b2252afdb02e11e8b9dc1d9173ef3bd5a  go1.5.linux-amd64.tar.gz' | shasum -c - && \
+  sudo tar -C /usr/local -xzf go1.5.linux-amd64.tar.gz
+	sudo ln -sf /usr/local/go/bin/{go,godoc,gofmt} /usr/local/bin/
+	rm go1.5.linux-amd64.tar.gz
+}
+
+function install_git_http_server() {
+	cd /home/git
+	if [ ! -d gitlab-git-http-server ]; then
+		sudo -u git -H git clone https://gitlab.com/gitlab-org/gitlab-git-http-server.git
+		cd gitlab-git-http-server
+		sudo -u git -H make
+	fi
+}
+
+function create_users() {
+	# This user is for gitolite. Its home is where your git repositories
+	# will be stored
+	adduser \
+ 		--system \
+  		--shell /bin/sh \
+  		--gecos 'Git Version Control' \
+  		--group \
+  		--disabled-password \
+  		--home /home/git \
+  		git || true
+
+	# This user is for gitlab, a web gui for managing your git repositories
+	adduser --disabled-login --gecos 'GitLab' gitlab || true
+
+	# Add it to the git group
+	usermod -a -G git gitlab
+
+	# Generate the SSH key
+	if [ ! -e /home/gitlab/.ssh/id_rsa ]; then
+		sudo -u gitlab -H ssh-keygen -q -N '' -t rsa -f /home/gitlab/.ssh/id_rsa
+	fi
+}
+
+function install_gitlab() {
+
+	# Clone GitLab repository
+	if [ ! -d /home/git/gitlab ]; then
+		# We'll install GitLab into home directory of the user "gitlab"
+		cd /home/git
+
+		# sudo -u gitlab -H git clone https://github.com/gitlabhq/gitlabhq.git gitlab
+		sudo -u git -H git clone https://gitlab.com/gitlab-org/gitlab-ce.git -b 7-14-stable gitlab
+
+	else
+		# Go to gitlab dir
+		cd /home/git/gitlab
+
+
+		# Gitlab 4.1 left behind modified Gemfile and Gemfile.lock, for some reason
+		# so stash them ot of the way so we can update
+		sudo -u git -H git stash
+
+		# Checkout to stable release
+		sudo -u git -H git checkout 7-14-stable
+
+		sudo -u git -H git pull
+	fi
+
+}
+
+
+
+resolve_dependencies
+install_ruby
+install_go
+create_users
+install_git_http_server
+install_gitlab
